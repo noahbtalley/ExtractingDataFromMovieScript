@@ -1,0 +1,244 @@
+#This program is designed to take a screenshot of a script and extract all information from it,
+#including scene, location, and character's actions/dialogue. Chat-GPT will output the information as a JSON and save it to the current directory.
+#Script extraction was chosen to keep with the theme..
+
+#WUpdated by Harry Grinling on 8/17/2024 for Support Partners test.
+
+#Note: image file must be rasterized--no vector images--.jpg, .png, .bmp, .tiff, and .gif are all acceptable formats.
+#      also checks for edge cases such as improper file types and too small of an image < 500x500.
+
+#      TO RUN THIS PROGRAM: Add your OpenAI key (line 23) and make sure program is in the same folder as images.
+
+import os
+import subprocess
+import sys
+import platform
+import logging
+import json
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Dependencies required for the script
+REQUIRED_PACKAGES = ["pillow", "pytesseract", "opencv-python", "openai", "python-dotenv"]
+
+def install_missing_packages():
+    """Checks and installs any missing packages."""
+    for package in REQUIRED_PACKAGES:
+        try:
+            __import__(package)
+        except ImportError:
+            logging.info(f"Package '{package}' is not installed. Installing now...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+# Ensure all packages are installed
+install_missing_packages()
+
+# Now import the dependencies after ensuring they are installed
+from PIL import Image
+import pytesseract
+import cv2
+import openai
+from dotenv import load_dotenv
+
+# Load environment variables from a .env file
+load_dotenv()
+
+# Set OpenAI API key from environment variable
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+SUPPORTED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif'}
+
+def check_tesseract_installed():
+    """Check if Tesseract is installed by trying to run the tesseract command."""
+    try:
+        subprocess.run(["tesseract", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        logging.info("Tesseract is already installed.")
+        return True
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Tesseract is not installed or not found in PATH: {e}")
+        return False
+    except FileNotFoundError:
+        logging.error("Tesseract is not installed or not found in PATH.")
+        return False
+
+def install_tesseract():
+    """Automatically install Tesseract based on the operating system."""
+    system = platform.system()
+
+    try:
+        if system == "Windows":
+            # On Windows, direct download from Tesseract official GitHub page
+            logging.info("Attempting to install Tesseract on Windows.")
+            tesseract_url = "https://github.com/tesseract-ocr/tesseract/releases/download/5.3.0/tesseract-ocr-w64-setup-v5.3.0.20221222.exe"
+            installer_path = "tesseract_installer.exe"
+            # Download the installer
+            subprocess.run(["curl", "-L", tesseract_url, "-o", installer_path], check=True)
+            # Run the installer
+            subprocess.run([installer_path, "/SILENT"], check=True)
+            os.remove(installer_path)  # Clean up the installer
+        elif system == "Darwin":  # macOS
+            logging.info("Attempting to install Tesseract on macOS.")
+            subprocess.run(["brew", "install", "tesseract"], check=True)
+        elif system == "Linux":
+            logging.info("Attempting to install Tesseract on Linux.")
+            subprocess.run(["sudo", "apt-get", "update"], check=True)
+            subprocess.run(["sudo", "apt-get", "install", "tesseract-ocr", "-y"], check=True)
+        else:
+            raise OSError("Unsupported operating system for automated Tesseract installation.")
+        logging.info("Tesseract installation completed successfully.")
+    except Exception as e:
+        logging.error(f"An error occurred while installing Tesseract: {e}")
+        sys.exit(1)
+
+def setup_tesseract():
+    """Ensure Tesseract is installed and properly configured."""
+    if not check_tesseract_installed():
+        logging.info("Tesseract is not installed. Installing now...")
+        install_tesseract()
+
+    # Set Tesseract path if necessary
+    system = platform.system()
+    if system == "Windows":
+        pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+    elif system == "Darwin":  # macOS
+        pytesseract.pytesseract.tesseract_cmd = '/usr/local/bin/tesseract'
+
+setup_tesseract()
+
+def preprocess_image(image_path):
+    """Preprocess image for OCR."""
+    try:
+        image = Image.open(image_path)
+        return image.convert('L')  # Convert to grayscale for better OCR accuracy
+    except Exception as e:
+        logging.error(f"Error while preprocessing image: {e}")
+        raise
+
+def is_low_quality_image(image_path):
+    """Checks if the image is of sufficient quality (resolution)."""
+    try:
+        image = cv2.imread(image_path)
+        height, width = image.shape[:2]
+        return height < 500 or width < 500
+    except Exception as e:
+        logging.error(f"Error while checking image quality: {e}")
+        raise
+
+def extract_text_from_image(image_path):
+    """Extracts text from the preprocessed image using Tesseract OCR."""
+    try:
+        if is_low_quality_image(image_path):
+            raise ValueError("Image resolution is too low.")
+        
+        image = preprocess_image(image_path)
+        text = pytesseract.image_to_string(image)
+        if not text.strip():
+            raise ValueError("No text could be extracted from the image.")
+        return text
+    except Exception as e:
+        logging.error(f"Error while extracting text: {e}")
+        raise
+
+def generate_custom_prompt(extracted_text):
+    """Generates a custom GPT-4 prompt based on extracted text."""
+    prompt = f"""
+    Extract and structure the key information in JSON format. Ensure that all characters mentioned in the scene are included in the 'characters' field, \
+    along with both their actions and dialogues. Keep scene descriptions concise, focusing only on the most important actions and settings. \
+    If a scene or any other description is not included in the text, omit the related field.
+
+    Example output format:
+
+    {{
+        "scenes": [
+            {{
+                "location": "Scene location",
+                "time": "Scene time",
+                "characters": [
+                    {{
+                        "name": "Character Name",
+                        "actions": [
+                            "Action 1",
+                            "Action 2"
+                        ],
+                        "dialogue": "Character's dialogue here"
+                    }},
+                    {{
+                        "name": "Another Character",
+                        "actions": [
+                            "Action 1",
+                            "Action 2"
+                        ],
+                        "dialogue": "Their dialogue here"
+                    }}
+                ]
+            }}
+        ]
+    }}
+
+    Text: {extracted_text}
+    """
+    return prompt
+
+def get_gpt_response(prompt):
+    """Sends the prompt to OpenAI's GPT model and retrieves the structured JSON output."""
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are an expert at reading movie scripts and organizing them into a structured JSON format."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=750,
+            temperature=0.5
+        )
+        return response.choices[0].message['content'].strip()
+    except Exception as e:
+        logging.error(f"Error communicating with GPT API: {e}")
+        raise
+
+def save_response_as_json(response_content, filename):
+    """Saves the GPT response to a JSON file."""
+    try:
+        response_json = json.loads(response_content)
+        with open(filename, 'w') as json_file:
+            json.dump(response_json, json_file, indent=4)
+        logging.info(f"Response successfully saved as {filename}")
+    except json.JSONDecodeError:
+        logging.error("Failed to parse GPT response as JSON.")
+        raise
+    except Exception as e:
+        logging.error(f"Error while saving JSON file: {e}")
+        raise
+
+def process_images_in_folder(folder_path):
+    """Processes all images in the specified folder."""
+    try:
+        for filename in os.listdir(folder_path):
+            if os.path.splitext(filename)[1].lower() in SUPPORTED_EXTENSIONS:
+                image_path = os.path.join(folder_path, filename)
+                logging.info(f"Processing file: {image_path}")
+                try:
+                    gpt_response = main(image_path)
+                    if gpt_response:
+                        json_filename = f"{os.path.splitext(filename)[0]}.json"
+                        save_response_as_json(gpt_response, json_filename)
+                except Exception as e:
+                    logging.error(f"Failed to process {filename}: {e}")
+    except Exception as e:
+        logging.error(f"Error while processing images in folder: {e}")
+        raise
+
+def main(image_path):
+    """Main function to handle the entire extraction and GPT processing pipeline."""
+    try:
+        extracted_text = extract_text_from_image(image_path)
+        prompt = generate_custom_prompt(extracted_text)
+        return get_gpt_response(prompt)
+    except Exception as e:
+        logging.error(f"An unexpected error occurred: {e}")
+        return None
+
+if __name__ == "__main__":
+    folder_path = "."  # Set to current directory by default
+    process_images_in_folder(folder_path)
